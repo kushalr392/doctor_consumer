@@ -81,26 +81,27 @@ def main():
         nonlocal workload_map, cancellations_last_minute, recent_cancellations
 
         try:
-            event_type = event.get("event_type")
-            doctor_id = event.get("doctor_id")
-            start_time = event.get("scheduled_time")
-            event_id = event.get("appointment_id", str(uuid.uuid4()))  # Generate event_id if missing
-
-            if not all([event_type, doctor_id, start_time]):
-                print(f"Invalid event: {event}.  Missing required fields.")
-                if not event_type:
-                    print(f"Missing event_type fields.")
-                if not doctor_id:
-                    print(f"Missing doctor_id fields.")
-                if not start_time:
-                    print(f"Missing scheduled_time fields.")
-
-                safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Missing required fields", "event": event})
-                return
-
-            start_datetime = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-
             if event_type == "appointment_created":
+
+                event_type = event.get("event_type")
+                doctor_id = event.get("doctor_id")
+                start_time = event.get("scheduled_time")
+                event_id = event.get("appointment_id", str(uuid.uuid4()))  # Generate event_id if missing
+
+                if not all([event_type, doctor_id, start_time]):
+                    print(f"Invalid event: {event}.  Missing required fields.")
+                    if not event_type:
+                        print(f"Missing event_type fields.")
+                    if not doctor_id:
+                        print(f"Missing doctor_id fields.")
+                    if not start_time:
+                        print(f"Missing scheduled_time fields.")
+
+                    safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Missing required fields", "event": event})
+                    return
+
+                start_datetime = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+
                 workload_map[doctor_id]["schedule"].append({"start_time": start_time, "event_id": event_id})
 
             elif event_type == "appointment_cancelled":
