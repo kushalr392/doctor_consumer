@@ -216,4 +216,5 @@ def consume_appointments():
 
 
 if __name__ == "__main__":
+    print("aijdojasiodjoaijsdoiajoisdjoiajsdojaosjdoiajsdoijao")
     consume_appointments()
