@@ -88,6 +88,13 @@ def main():
 
             if not all([event_type, doctor_id, start_time]):
                 print(f"Invalid event: {event}.  Missing required fields.")
+                if not event_type:
+                    print(f"Missing event_type fields.")
+                if not doctor_id:
+                    print(f"Missing doctor_id fields.")
+                if not start_time:
+                    print(f"Missing scheduled_time fields.")
+
                 safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Missing required fields", "event": event})
                 return
 
