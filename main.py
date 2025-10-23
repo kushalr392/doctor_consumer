@@ -81,9 +81,10 @@ def main():
         nonlocal workload_map, cancellations_last_minute, recent_cancellations
 
         try:
+            
+            event_type = event.get("event_type")
             if event_type == "appointment_created":
 
-                event_type = event.get("event_type")
                 doctor_id = event.get("doctor_id")
                 start_time = event.get("scheduled_time")
                 event_id = event.get("appointment_id", str(uuid.uuid4()))  # Generate event_id if missing
