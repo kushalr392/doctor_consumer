@@ -1,181 +1,219 @@
-import json
 import os
+import json
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Configuration from environment variables
-BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS", "localhost:9092")
-SASL_USERNAME = os.environ.get("SASL_USERNAME", "user")
-SASL_PASSWORD = os.environ.get("SASL_PASSWORD", "password")
-INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "appointment_events")
-OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "doctor_summary")
+# Configuration (from environment variables)
+BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS")
+SASL_USERNAME = os.environ.get("SASL_USERNAME")
+SASL_PASSWORD = os.environ.get("SASL_PASSWORD")
+INPUT_TOPIC = os.environ.get("INPUT_TOPIC")
+OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC")
 DEAD_LETTER_TOPIC = os.environ.get("DEAD_LETTER_TOPIC", "appointment_events_dead_letter")
-GROUP_ID = os.environ.get("GROUP_ID", "appointment_processor")
-SUMMARY_INTERVAL_SECONDS = int(os.environ.get("SUMMARY_INTERVAL_SECONDS", "10"))
+SUMMARY_INTERVAL = int(os.environ.get("SUMMARY_INTERVAL", "10"))  # seconds
+GROUP_ID = os.environ.get("GROUP_ID", "appointment_consumer_group")
 
-def kafka_producer():
-    return KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        security_protocol="SASL_PLAINTEXT",
-        sasl_mechanism="SCRAM-SHA-512",
-        sasl_plain_username=SASL_USERNAME,
-        sasl_plain_password=SASL_PASSWORD,
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(0, 11, 5)  # Specify API version
-    )
+# In-memory workload map
+doctor_workload = defaultdict(lambda: {"hours": 0, "schedule": []})
+cancellations_last_minute = 0
+last_summary_time = time.time()
+last_cancellation_reset_time = time.time()
 
 
-def kafka_consumer():
-    return KafkaConsumer(
-        INPUT_TOPIC,
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        security_protocol="SASL_PLAINTEXT",
-        sasl_mechanism="SCRAM-SHA-512",
-        sasl_plain_username=SASL_USERNAME,
-        sasl_plain_password=SASL_PASSWORD,
-        auto_offset_reset='latest',
-        enable_auto_commit=True,
-        group_id=GROUP_ID,
-        value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-        api_version=(0, 11, 5)  # Specify API version
-    )
+def kafka_consumer_config():
+    """Returns Kafka consumer configuration."""
+    return {
+        'bootstrap_servers': BOOTSTRAP_SERVERS,
+        'sasl_mechanism': 'SCRAM-SHA-512',
+        'security_protocol': 'SASL_PLAINTEXT',
+        'sasl_plain_username': SASL_USERNAME,
+        'sasl_plain_password': SASL_PASSWORD,
+        'group_id': GROUP_ID,
+        'auto_offset_reset': 'earliest',  # or 'latest'
+        'enable_auto_commit': True,
+        'consumer_timeout_ms': 1000  # 1 second
+    }
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-       retry=retry_if_exception_type(KafkaError))
-def safe_send(producer, topic, message):
+def kafka_producer_config():
+    """Returns Kafka producer configuration."""
+    return {
+        'bootstrap_servers': BOOTSTRAP_SERVERS,
+        'sasl_mechanism': 'SCRAM-SHA-512',
+        'security_protocol': 'SASL_PLAINTEXT',
+        'sasl_plain_username': SASL_USERNAME,
+        'sasl_plain_password': SASL_PASSWORD,
+        'linger_ms': 100  # Reduce latency
+    }
+
+
+def serialize_message(message):
+    """Serializes a message to JSON."""
     try:
-        producer.send(topic, message).get(timeout=10)  # Get blocks until completion or timeout
-    except KafkaError as e:
-        print(f"Error sending to Kafka: {e}")
-        raise
+        return json.dumps(message).encode('utf-8')
+    except Exception as e:
+        print(f"Error serializing message: {e}")
+        return None
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-       retry=retry_if_exception_type(KafkaError))
-def safe_consume(consumer, process_message):
+def deserialize_message(message_value):
+    """Deserializes a message from JSON."""
     try:
-        for message in consumer:
-            process_message(message.value)
-    except KafkaError as e:
-        print(f"Error consuming from Kafka: {e}")
-        raise
+        return json.loads(message_value.decode('utf-8'))
+    except Exception as e:
+        print(f"Error deserializing message: {e}")
+        return None
 
 
-def main():
-    workload_map = defaultdict(lambda: {"hours_booked": 0, "schedule": []})
-    cancellations_last_minute = 0
-    last_summary_time = time.time()
-    cancellations_reset_time = time.time()  # Time when cancellations were last reset
-    recent_cancellations = []  # List to hold timestamps of recent cancellations
-
-    producer = kafka_producer()
-    consumer = kafka_consumer()
-
-    def process_appointment_event(event):
-        nonlocal workload_map, cancellations_last_minute, recent_cancellations
-
-        try:
-            
-            event_type = event.get("event_type")
-            if event_type == "appointment_created":
-
-                doctor_id = event.get("doctor_id")
-                start_time = event.get("scheduled_time")
-                event_id = event.get("appointment_id", str(uuid.uuid4()))  # Generate event_id if missing
-
-                if not all([event_type, doctor_id, start_time]):
-                    print(f"Invalid event: {event}.  Missing required fields.")
-                    if not event_type:
-                        print(f"Missing event_type fields.")
-                    if not doctor_id:
-                        print(f"Missing doctor_id fields.")
-                    if not start_time:
-                        print(f"Missing scheduled_time fields.")
-
-                    safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Missing required fields", "event": event})
-                    return
-
-                start_datetime = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-
-                workload_map[doctor_id]["schedule"].append({"start_time": start_time, "event_id": event_id})
-
-            elif event_type == "appointment_cancelled":
-                # Cancellation tracking
-                cancellation_time = datetime.utcnow()
-                recent_cancellations.append(cancellation_time)
-
-                # Remove from schedule
-                original_length = len(workload_map[doctor_id]["schedule"])
-                workload_map[doctor_id]["schedule"] = [
-                    slot for slot in workload_map[doctor_id]["schedule"]
-                    if slot.get("event_id") != event_id  # Match on event_id
-                ]
-
-                removed_count = original_length - len(workload_map[doctor_id]["schedule"])
-                if removed_count == 0:
-                    print(f"Warning: Cancellation {event_id} not found for doctor {doctor_id}")
-
-                # workload_map[doctor_id]["hours_booked"] = sum(
-                #     (datetime.fromisoformat(s["end_time"].replace('Z', '+00:00')) - datetime.fromisoformat(s["start_time"].replace('Z', '+00:00'))).total_seconds() / 3600
-                #     for s in workload_map[doctor_id]["schedule"]
-                # )
-
-            else:
-                print(f"Unknown event type: {event_type}")
-                safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Unknown event type", "event": event})
-
-        except Exception as e:
-            print(f"Error processing event: {e}. Event: {event}")
-            safe_send(producer, DEAD_LETTER_TOPIC, {"error": str(e), "event": event})
-
-    def generate_summary():
-        nonlocal workload_map, last_summary_time, cancellations_last_minute, cancellations_reset_time, recent_cancellations
-
-        # Calculate top 3 busiest doctors
-        busiest_doctors = sorted(workload_map.items(), key=lambda item: item[1]["hours_booked"], reverse=True)[:3]
-        busiest_doctors_summary = [{"doctor_id": doc_id, "hours_booked": doc_data["hours_booked"]} for doc_id, doc_data in busiest_doctors]
-
-        # Find idle doctors
-        idle_doctors = [doc_id for doc_id, doc_data in workload_map.items() if doc_data["hours_booked"] == 0]
-
-        # Calculate cancellations in the last minute
-        current_time = datetime.utcnow()
-        one_minute_ago = current_time - timedelta(minutes=1)
-        cancellations_last_minute = sum(1 for cancel_time in recent_cancellations if cancel_time >= one_minute_ago)
-
-        # Remove older cancellation records
-        recent_cancellations = [cancel_time for cancel_time in recent_cancellations if cancel_time >= one_minute_ago]
-
-        summary = {
-            "top_3_busiest_doctors": busiest_doctors_summary,
-            "idle_doctors": idle_doctors,
-            "total_cancellations_last_minute": cancellations_last_minute,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-        safe_send(producer, OUTPUT_TOPIC, summary)
-        print(f"Summary sent: {summary}")
-        last_summary_time = time.time()
-
+def send_to_dead_letter_queue(message, error):
+    """Sends a message to the dead-letter topic."""
+    producer_conf = kafka_producer_config()
+    producer = KafkaProducer(**producer_conf)
     try:
-        while True:
-            safe_consume(consumer, process_appointment_event)  # Consume and process messages
+        if message.value is not None:
+          deserialized_message = deserialize_message(message.value)
+        else:
+          deserialized_message = None
+        headers = message.headers if hasattr(message, 'headers') else []
+        headers.append(('error', str(error).encode('utf-8')))
 
-            if time.time() - last_summary_time >= SUMMARY_INTERVAL_SECONDS:
-                generate_summary()
 
-    except KeyboardInterrupt:
-        print("Shutting down...")
+        producer.send(
+            DEAD_LETTER_TOPIC,
+            value=serialize_message({
+                "original_message": deserialized_message,
+                "error": str(error)
+            }),
+            headers=headers
+        )
+        producer.flush()  # Ensure message is sent
+        print(f"Sent message to dead-letter topic: {error}")
+    except Exception as e:
+        print(f"Failed to send to dead-letter topic: {e}")
     finally:
         producer.close()
+
+
+def process_appointment_event(event):
+    """Processes an appointment event and updates the workload map."""
+    global doctor_workload, cancellations_last_minute
+
+    if event['event_type'] == 'appointment_created':
+        doctor_id = event['doctor_id']
+        scheduled_time_str = event['scheduled_time']
+        try:
+            scheduled_time = datetime.fromisoformat(scheduled_time_str.replace('Z', '+00:00'))
+        except ValueError:
+            scheduled_time = datetime.strptime(scheduled_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+
+        # Assuming each appointment is 1 hour for simplicity
+        doctor_workload[doctor_id]["hours"] += 1
+        doctor_workload[doctor_id]["schedule"].append(scheduled_time)
+        print(f"Appointment created for doctor {doctor_id} at {scheduled_time}")
+
+    elif event['event_type'] == 'appointment_cancelled':
+        cancellations_last_minute += 1
+        appointment_id = event['appointment_id']
+        # Find and remove the appointment from the doctor's schedule
+        for doctor_id, workload in doctor_workload.items():
+            for i, scheduled_time in enumerate(workload["schedule"]):
+                #  Naive approach.  Consider indexing if scale becomes an issue.
+                #  Assuming appointment_id is not stored, but can be improved.
+                try:
+                    scheduled_time_str = scheduled_time.isoformat()
+                except AttributeError:  # Handle timezone-naive datetimes
+                    scheduled_time_str = scheduled_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+                if scheduled_time_str in event['cancellation_time']:  # Likely match
+                    doctor_workload[doctor_id]["hours"] -= 1
+                    del workload["schedule"][i]
+                    print(f"Appointment cancelled for appointment ID {appointment_id}")
+                    break  # Exit inner loop after finding and removing
+            else:
+                continue  # Only executed if the inner loop did NOT break
+            break  # Exit outer loop if inner loop broke
+    else:
+        print(f"Unknown event type: {event['event_type']}")
+
+
+def generate_summary():
+    """Generates a summary of the doctor workload."""
+    global doctor_workload, cancellations_last_minute
+
+    # Top 3 busiest doctors
+    sorted_doctors = sorted(doctor_workload.items(), key=lambda item: item[1]["hours"], reverse=True)[:3]
+    top_doctors = [{"doctor_id": doctor_id, "hours": workload["hours"]} for doctor_id, workload in sorted_doctors]
+
+    # Idle doctors
+    idle_doctors = [doctor_id for doctor_id, workload in doctor_workload.items() if workload["hours"] == 0]
+
+    summary = {
+        "top_doctors": top_doctors,
+        "idle_doctors": idle_doctors,
+        "total_cancellations_last_minute": cancellations_last_minute
+    }
+
+    return summary
+
+
+def produce_summary(summary):
+    """Produces the summary to the output topic."""
+    producer_conf = kafka_producer_config()
+    producer = KafkaProducer(**producer_conf)
+
+    try:
+        producer.send(
+            OUTPUT_TOPIC,
+            value=serialize_message(summary)
+        )
+        producer.flush()
+        print(f"Summary sent to topic {OUTPUT_TOPIC}: {summary}")
+    except Exception as e:
+        print(f"Failed to produce summary: {e}")
+    finally:
+        producer.close()
+
+
+
+def consume_appointments():
+    """Consumes appointment events from Kafka."""
+    global cancellations_last_minute, last_summary_time, last_cancellation_reset_time
+
+    consumer_conf = kafka_consumer_config()
+    consumer = KafkaConsumer(**consumer_conf, value_deserializer=deserialize_message)
+    consumer.subscribe([INPUT_TOPIC])
+
+    try:
+        for message in consumer:
+            try:
+                event = message.value
+                if event:
+                    process_appointment_event(event)
+            except Exception as e:
+                print(f"Error processing message: {e}")
+                send_to_dead_letter_queue(message, e)
+                continue
+
+            # Generate and send summary every SUMMARY_INTERVAL seconds
+            if time.time() - last_summary_time >= SUMMARY_INTERVAL:
+                summary = generate_summary()
+                produce_summary(summary)
+                last_summary_time = time.time()
+
+                # Reset cancellation count every minute
+                if time.time() - last_cancellation_reset_time >= 60:
+                    cancellations_last_minute = 0
+                    last_cancellation_reset_time = time.time()
+
+    except KeyboardInterrupt:
+        print("Shutting down consumer...")
+    finally:
         consumer.close()
 
 
 if __name__ == "__main__":
-    main()
+    consume_appointments()
