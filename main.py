@@ -83,11 +83,10 @@ def main():
         try:
             event_type = event.get("event_type")
             doctor_id = event.get("doctor_id")
-            start_time = event.get("start_time")
-            end_time = event.get("end_time")
-            event_id = event.get("event_id", str(uuid.uuid4()))  # Generate event_id if missing
+            start_time = event.get("scheduled_time")
+            event_id = event.get("appointment_id", str(uuid.uuid4()))  # Generate event_id if missing
 
-            if not all([event_type, doctor_id, start_time, end_time]):
+            if not all([event_type, doctor_id, start_time]):
                 print(f"Invalid event: {event}.  Missing required fields.")
                 safe_send(producer, DEAD_LETTER_TOPIC, {"error": "Missing required fields", "event": event})
                 return
