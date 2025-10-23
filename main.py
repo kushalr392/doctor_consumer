@@ -92,12 +92,9 @@ def main():
                 return
 
             start_datetime = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-            end_datetime = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
-            duration_hours = (end_datetime - start_datetime).total_seconds() / 3600
 
             if event_type == "appointment_created":
-                workload_map[doctor_id]["hours_booked"] += duration_hours
-                workload_map[doctor_id]["schedule"].append({"start_time": start_time, "end_time": end_time, "event_id": event_id})
+                workload_map[doctor_id]["schedule"].append({"start_time": start_time, "event_id": event_id})
 
             elif event_type == "appointment_cancelled":
                 # Cancellation tracking
@@ -115,10 +112,10 @@ def main():
                 if removed_count == 0:
                     print(f"Warning: Cancellation {event_id} not found for doctor {doctor_id}")
 
-                workload_map[doctor_id]["hours_booked"] = sum(
-                    (datetime.fromisoformat(s["end_time"].replace('Z', '+00:00')) - datetime.fromisoformat(s["start_time"].replace('Z', '+00:00'))).total_seconds() / 3600
-                    for s in workload_map[doctor_id]["schedule"]
-                )
+                # workload_map[doctor_id]["hours_booked"] = sum(
+                #     (datetime.fromisoformat(s["end_time"].replace('Z', '+00:00')) - datetime.fromisoformat(s["start_time"].replace('Z', '+00:00'))).total_seconds() / 3600
+                #     for s in workload_map[doctor_id]["schedule"]
+                # )
 
             else:
                 print(f"Unknown event type: {event_type}")
