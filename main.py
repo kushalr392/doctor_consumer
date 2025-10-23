@@ -2,7 +2,6 @@ import os
 import json
 import time
 import uuid
-import logging
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from kafka import KafkaConsumer, KafkaProducer
@@ -56,10 +55,10 @@ def serialize_message(message):
     """Serializes a message to JSON."""
     try:
         serialized = json.dumps(message).encode('utf-8')
-        logging.debug("Serialized message successfully")
+        print("DEBUG: Serialized message successfully")
         return serialized
     except Exception as e:
-        logging.exception("Error serializing message")
+        print(f"ERROR: Error serializing message: {e}")
         return None
 
 
@@ -68,10 +67,10 @@ def deserialize_message(message_value):
     try:
         decoded = message_value.decode('utf-8') if isinstance(message_value, (bytes, bytearray)) else message_value
         obj = json.loads(decoded)
-        logging.debug("Deserialized message: %s", obj)
+        print(f"DEBUG: Deserialized message: {obj}")
         return obj
     except Exception as e:
-        logging.exception("Error deserializing message")
+        print(f"ERROR: Error deserializing message: {e}")
         return None
 
 
@@ -95,7 +94,7 @@ def send_to_dead_letter_queue(message, error):
 
         serialized = serialize_message(payload)
         if serialized is None:
-            logging.error("Dead-letter payload serialization failed; dropping message: %s", payload)
+            print(f"ERROR: Dead-letter payload serialization failed; dropping message: {payload}")
             return
 
         producer.send(
@@ -104,9 +103,9 @@ def send_to_dead_letter_queue(message, error):
             headers=headers
         )
         producer.flush()  # Ensure message is sent
-        logging.info("Sent message to dead-letter topic: %s", error)
+        print(f"INFO: Sent message to dead-letter topic: {error}")
     except Exception as e:
-        logging.exception("Failed to send to dead-letter topic")
+        print(f"ERROR: Failed to send to dead-letter topic: {e}")
     finally:
         producer.close()
 
@@ -117,14 +116,14 @@ def process_appointment_event(event):
     try:
         event_type = event.get('event_type')
     except Exception:
-        logging.error("Event is not a dict or missing 'event_type': %s", event)
+        print(f"ERROR: Event is not a dict or missing 'event_type': {event}")
         return
 
     if event_type == 'appointment_created':
         doctor_id = event.get('doctor_id')
         scheduled_time_str = event.get('scheduled_time')
         if doctor_id is None or scheduled_time_str is None:
-            logging.error("Missing doctor_id or scheduled_time in event: %s", event)
+            print(f"ERROR: Missing doctor_id or scheduled_time in event: {event}")
             return
 
         try:
@@ -133,22 +132,22 @@ def process_appointment_event(event):
             try:
                 scheduled_time = datetime.strptime(scheduled_time_str, '%Y-%m-%dT%H:%M:%S.%f')
             except Exception:
-                logging.exception("Failed to parse scheduled_time: %s", scheduled_time_str)
+                print(f"ERROR: Failed to parse scheduled_time: {scheduled_time_str}")
                 return
 
         # Assuming each appointment is 1 hour for simplicity
         doctor_workload[doctor_id]["hours"] += 1
         doctor_workload[doctor_id]["schedule"].append(scheduled_time)
-        logging.info("Appointment created for doctor %s at %s", doctor_id, scheduled_time)
+        print(f"INFO: Appointment created for doctor {doctor_id} at {scheduled_time}")
 
     elif event_type == 'appointment_cancelled':
         cancellations_last_minute += 1
         appointment_id = event.get('appointment_id')
         cancellation_time = event.get('cancellation_time')
-        logging.info("Processing cancellation for appointment_id=%s at %s", appointment_id, cancellation_time)
+        print(f"INFO: Processing cancellation for appointment_id={appointment_id} at {cancellation_time}")
 
         if not cancellation_time:
-            logging.warning("Cancellation event missing cancellation_time: %s", event)
+            print(f"WARN: Cancellation event missing cancellation_time: {event}")
             return
 
         # Find and remove the appointment from the doctor's schedule
@@ -164,15 +163,15 @@ def process_appointment_event(event):
                 if scheduled_time_str in cancellation_time:
                     doctor_workload[doctor_id]["hours"] -= 1
                     del workload["schedule"][i]
-                    logging.info("Appointment cancelled for appointment ID %s (doctor=%s)", appointment_id, doctor_id)
+                    print(f"INFO: Appointment cancelled for appointment ID {appointment_id} (doctor={doctor_id})")
                     removed = True
                     break  # Exit inner loop after finding and removing
             if removed:
                 break
         if not removed:
-            logging.warning("Could not find appointment to cancel for event: %s", event)
+            print(f"WARN: Could not find appointment to cancel for event: {event}")
     else:
-        logging.warning("Unknown event type: %s", event_type)
+        print(f"WARN: Unknown event type: {event_type}")
 
 
 def generate_summary():
