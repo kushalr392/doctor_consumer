@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import logging
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from kafka import KafkaConsumer, KafkaProducer
@@ -54,18 +55,23 @@ def kafka_producer_config():
 def serialize_message(message):
     """Serializes a message to JSON."""
     try:
-        return json.dumps(message).encode('utf-8')
+        serialized = json.dumps(message).encode('utf-8')
+        logging.debug("Serialized message successfully")
+        return serialized
     except Exception as e:
-        print(f"Error serializing message: {e}")
+        logging.exception("Error serializing message")
         return None
 
 
 def deserialize_message(message_value):
     """Deserializes a message from JSON."""
     try:
-        return json.loads(message_value.decode('utf-8'))
+        decoded = message_value.decode('utf-8') if isinstance(message_value, (bytes, bytearray)) else message_value
+        obj = json.loads(decoded)
+        logging.debug("Deserialized message: %s", obj)
+        return obj
     except Exception as e:
-        print(f"Error deserializing message: {e}")
+        logging.exception("Error deserializing message")
         return None
 
 
@@ -74,26 +80,33 @@ def send_to_dead_letter_queue(message, error):
     producer_conf = kafka_producer_config()
     producer = KafkaProducer(**producer_conf)
     try:
-        if message.value is not None:
-          deserialized_message = deserialize_message(message.value)
+        if hasattr(message, 'value') and message.value is not None:
+            deserialized_message = deserialize_message(message.value)
         else:
-          deserialized_message = None
-        headers = message.headers if hasattr(message, 'headers') else []
+            deserialized_message = None
+
+        headers = list(message.headers) if hasattr(message, 'headers') and message.headers is not None else []
         headers.append(('error', str(error).encode('utf-8')))
 
+        payload = {
+            "original_message": deserialized_message,
+            "error": str(error)
+        }
+
+        serialized = serialize_message(payload)
+        if serialized is None:
+            logging.error("Dead-letter payload serialization failed; dropping message: %s", payload)
+            return
 
         producer.send(
             DEAD_LETTER_TOPIC,
-            value=serialize_message({
-                "original_message": deserialized_message,
-                "error": str(error)
-            }),
+            value=serialized,
             headers=headers
         )
         producer.flush()  # Ensure message is sent
-        print(f"Sent message to dead-letter topic: {error}")
+        logging.info("Sent message to dead-letter topic: %s", error)
     except Exception as e:
-        print(f"Failed to send to dead-letter topic: {e}")
+        logging.exception("Failed to send to dead-letter topic")
     finally:
         producer.close()
 
@@ -101,43 +114,65 @@ def send_to_dead_letter_queue(message, error):
 def process_appointment_event(event):
     """Processes an appointment event and updates the workload map."""
     global doctor_workload, cancellations_last_minute
+    try:
+        event_type = event.get('event_type')
+    except Exception:
+        logging.error("Event is not a dict or missing 'event_type': %s", event)
+        return
 
-    if event['event_type'] == 'appointment_created':
-        doctor_id = event['doctor_id']
-        scheduled_time_str = event['scheduled_time']
+    if event_type == 'appointment_created':
+        doctor_id = event.get('doctor_id')
+        scheduled_time_str = event.get('scheduled_time')
+        if doctor_id is None or scheduled_time_str is None:
+            logging.error("Missing doctor_id or scheduled_time in event: %s", event)
+            return
+
         try:
             scheduled_time = datetime.fromisoformat(scheduled_time_str.replace('Z', '+00:00'))
-        except ValueError:
-            scheduled_time = datetime.strptime(scheduled_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+        except Exception:
+            try:
+                scheduled_time = datetime.strptime(scheduled_time_str, '%Y-%m-%dT%H:%M:%S.%f')
+            except Exception:
+                logging.exception("Failed to parse scheduled_time: %s", scheduled_time_str)
+                return
 
         # Assuming each appointment is 1 hour for simplicity
         doctor_workload[doctor_id]["hours"] += 1
         doctor_workload[doctor_id]["schedule"].append(scheduled_time)
-        print(f"Appointment created for doctor {doctor_id} at {scheduled_time}")
+        logging.info("Appointment created for doctor %s at %s", doctor_id, scheduled_time)
 
-    elif event['event_type'] == 'appointment_cancelled':
+    elif event_type == 'appointment_cancelled':
         cancellations_last_minute += 1
-        appointment_id = event['appointment_id']
+        appointment_id = event.get('appointment_id')
+        cancellation_time = event.get('cancellation_time')
+        logging.info("Processing cancellation for appointment_id=%s at %s", appointment_id, cancellation_time)
+
+        if not cancellation_time:
+            logging.warning("Cancellation event missing cancellation_time: %s", event)
+            return
+
         # Find and remove the appointment from the doctor's schedule
+        removed = False
         for doctor_id, workload in doctor_workload.items():
             for i, scheduled_time in enumerate(workload["schedule"]):
                 #  Naive approach.  Consider indexing if scale becomes an issue.
-                #  Assuming appointment_id is not stored, but can be improved.
                 try:
                     scheduled_time_str = scheduled_time.isoformat()
-                except AttributeError:  # Handle timezone-naive datetimes
+                except Exception:
                     scheduled_time_str = scheduled_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
 
-                if scheduled_time_str in event['cancellation_time']:  # Likely match
+                if scheduled_time_str in cancellation_time:
                     doctor_workload[doctor_id]["hours"] -= 1
                     del workload["schedule"][i]
-                    print(f"Appointment cancelled for appointment ID {appointment_id}")
+                    logging.info("Appointment cancelled for appointment ID %s (doctor=%s)", appointment_id, doctor_id)
+                    removed = True
                     break  # Exit inner loop after finding and removing
-            else:
-                continue  # Only executed if the inner loop did NOT break
-            break  # Exit outer loop if inner loop broke
+            if removed:
+                break
+        if not removed:
+            logging.warning("Could not find appointment to cancel for event: %s", event)
     else:
-        print(f"Unknown event type: {event['event_type']}")
+        logging.warning("Unknown event type: %s", event_type)
 
 
 def generate_summary():
@@ -186,12 +221,15 @@ def consume_appointments():
     consumer_conf = kafka_consumer_config()
     consumer = KafkaConsumer(**consumer_conf, value_deserializer=deserialize_message)
     consumer.subscribe([INPUT_TOPIC])
+    print("Started consuming appointment events...")
 
     try:
         for message in consumer:
             try:
+                print("Processing new message...")
                 event = message.value
                 if event:
+                    print(f"Received message: {event}")
                     process_appointment_event(event)
             except Exception as e:
                 print(f"Error processing message: {e}")
@@ -200,12 +238,14 @@ def consume_appointments():
 
             # Generate and send summary every SUMMARY_INTERVAL seconds
             if time.time() - last_summary_time >= SUMMARY_INTERVAL:
+                print("Generating summary...")
                 summary = generate_summary()
                 produce_summary(summary)
                 last_summary_time = time.time()
 
                 # Reset cancellation count every minute
                 if time.time() - last_cancellation_reset_time >= 60:
+                    print("Resetting cancellation count...")
                     cancellations_last_minute = 0
                     last_cancellation_reset_time = time.time()
 
