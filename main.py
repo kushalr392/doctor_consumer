@@ -251,6 +251,7 @@ def consume_appointments():
     except KeyboardInterrupt:
         print("Shutting down consumer...")
     finally:
+        print("Clsoing consumer...")
         consumer.close()
 
 
